@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    container_name: memgraph-mage
+    user: "1000:1000"
+    networks:
+      - internal-network
+    ports:
+      - "7687:7687"
+      - "7444:7444"
+    volumes:
+      - ./memgraph_data:/var/lib/memgraph
+    command:
+      - "--log-level=WARNING"
+      - "--also-log-to-stderr"
+      - "--log-file="
+      - "--query-modules-directory=/usr/lib/memgraph/query_modules"
+      - "--storage-snapshot-interval-sec=600"
+      - "--storage-snapshot-retention-count=2"
+
+  memgraph-lab:
+    image: memgraph/lab:latest
+    container_name: memgraph-lab
+    networks:
+      - internal-network
+    ports:
+      - "3000:3000"
+    depends_on:
+      - memgraph
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+
+volumes:
+  memgraph_data:
+
+networks:
+  internal-network:
+    external: true
+    name: internal-network

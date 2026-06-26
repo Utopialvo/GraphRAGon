@@ -1,0 +1,143 @@
+# src/embedding_client.py
+
+"""
+Модуль для вычисления текстовых эмбеддингов с использованием sentence-transformers.
+Улучшено кэширование: одно соединение на батч в embed_batch.
+"""
+
+import hashlib
+import sqlite3
+import json
+from typing import Optional, List, Union
+
+
+class EmbeddingClient:
+    """Клиент для генерации эмбеддингов текстов с кэшированием."""
+
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        cache_db: str = "llm_cache.db",
+        batch_size: int = 32,
+        precision: str = "float32",
+    ):
+        self.model_name = model_name
+        self.cache_db = cache_db
+        self.batch_size = batch_size
+        self.precision = precision
+        self._model = None
+        self._dim = None
+        self._init_cache()
+
+    def _init_cache(self) -> None:
+        conn = sqlite3.connect(self.cache_db)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                key TEXT PRIMARY KEY,
+                embedding TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    @property
+    def model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self.model_name)
+            self._dim = self._model.get_embedding_dimension()
+        return self._model
+
+    @property
+    def dim(self) -> int:
+        if self._dim is None:
+            _ = self.model
+        return self._dim
+
+    def embed(
+        self,
+        text: str,
+        prompt_name: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> list:
+        """
+        Возвращает нормализованный эмбеддинг для одного текста.
+        """
+        key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
+        conn = sqlite3.connect(self.cache_db)
+        cur = conn.execute("SELECT embedding FROM embedding_cache WHERE key=?", (key,))
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return json.loads(row[0])
+
+        emb = self.model.encode(
+            text,
+            prompt_name=prompt_name,
+            prompt=prompt,
+            normalize_embeddings=True,
+            precision=self.precision,
+        ).tolist()
+
+        emb_json = json.dumps(emb)
+        conn.execute(
+            "INSERT OR REPLACE INTO embedding_cache (key, embedding) VALUES (?, ?)",
+            (key, emb_json)
+        )
+        conn.commit()
+        conn.close()
+        return emb
+
+    def embed_batch(
+        self,
+        texts: List[str],
+        prompt_name: Optional[str] = None,
+        prompt: Optional[str] = None,
+    ) -> List[list]:
+        """
+        Возвращает список эмбеддингов для нескольких текстов.
+        Оптимизация: одно открытие БД для всех операций кэша.
+        """
+        results = []
+        to_encode = []
+        to_encode_indices = []
+        conn = sqlite3.connect(self.cache_db)
+
+        try:
+            # Проверяем кэш для каждого текста
+            for idx, text in enumerate(texts):
+                key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
+                cur = conn.execute("SELECT embedding FROM embedding_cache WHERE key=?", (key,))
+                row = cur.fetchone()
+                if row:
+                    results.append((idx, json.loads(row[0])))
+                else:
+                    to_encode.append(text)
+                    to_encode_indices.append(idx)
+
+            if to_encode:
+                encoded = self.model.encode(
+                    to_encode,
+                    prompt_name=prompt_name,
+                    prompt=prompt,
+                    normalize_embeddings=True,
+                    batch_size=self.batch_size,
+                    precision=self.precision,
+                )
+                for i, emb in enumerate(encoded):
+                    emb_list = emb.tolist()
+                    results.append((to_encode_indices[i], emb_list))
+                    text = to_encode[i]
+                    key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
+                    conn.execute(
+                        "INSERT OR REPLACE INTO embedding_cache (key, embedding) VALUES (?, ?)",
+                        (key, json.dumps(emb_list))
+                    )
+                conn.commit()
+        finally:
+            conn.close()
+
+        # Сортируем по исходному порядку
+        results.sort(key=lambda x: x[0])
+        return [r[1] for r in results]
