@@ -168,3 +168,16 @@ class Merge(Operation):
             metadata={"merged_from": [t.id for t in inputs]}
         )
         return [merged]
+
+
+class Select(Operation):
+    """Выбирает top_k мыслей по наибольшей оценке."""
+    def __init__(self, top_k: int = 2, score_key: str = 'score'):
+        self.top_k = top_k
+        self.score_key = score_key
+
+    def execute(self, inputs: List[Thought], prompter: Prompter, parser: Parser, llm_client, **kwargs) -> List[Thought]:
+        if not inputs:
+            return []
+        sorted_inputs = sorted(inputs, key=lambda t: getattr(t, self.score_key, 0.0), reverse=True)
+        return sorted_inputs[:self.top_k]

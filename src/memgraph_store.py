@@ -2,7 +2,7 @@
 
 """
 Работа с графовой базой Memgraph.
-Хранит сущности, отношения, пассажи и векторный индекс.
+Хранит сущности, отношения, пассажи и векторные индексы.
 Все публичные методы потокобезопасны (используется RLock).
 Добавлен временный кэш эмбеддингов для ускорения массовой загрузки.
 """
@@ -71,44 +71,33 @@ class MemgraphStore:
             logging.info("Снэпшот Memgraph создан.")
 
     # ---------- Индексы ----------
+    def _create_vector_index(
+        self,
+        index_name: str,
+        label: str,
+        property: str,
+        dim: int
+    ) -> None:
+        """Принудительно пересоздаёт векторный индекс."""
+        try:
+            self.db.execute(f"DROP VECTOR INDEX {index_name}")
+            logging.info(f"Существующий индекс {index_name} удалён перед пересозданием.")
+        except Exception as e:
+            logging.debug(f"Индекс {index_name} не существовал: {e}")
+    
+        query = f"""
+        CREATE VECTOR INDEX {index_name} ON :{label}({property})
+        WITH CONFIG {{"dimension": {dim}, "capacity": {self.index_capacity}}}
+        """
+        self.db.execute(query)
+        logging.info(f"Векторный индекс {index_name} создан с размерностью {dim}.")
+    
     def _init_index(self) -> None:
         if not self.embedding_client:
             return
         dim = self.embedding_client.dim
-        index_name = "entity_embeddings"
-
-        try:
-            cursor = self.db.execute_and_fetch("SHOW VECTOR INDEXES")
-            if cursor:
-                for row in cursor:
-                    if row.get('name') == index_name:
-                        existing_dim = row.get('dimension')
-                        if existing_dim is not None and existing_dim != dim:
-                            logging.warning(
-                                f"Индекс {index_name} имеет размерность {existing_dim}, "
-                                f"требуется {dim}. Пересоздаём..."
-                            )
-                            self.db.execute(f"DROP VECTOR INDEX {index_name}")
-                        else:
-                            logging.info(f"Векторный индекс {index_name} уже существует с размерностью {dim}")
-                            return
-        except Exception as e:
-            logging.debug(f"Не удалось проверить индекс: {e}")
-
-        try:
-            self.db.execute(
-                f"""
-                CREATE VECTOR INDEX {index_name} ON :Entity(embedding)
-                WITH CONFIG {{"dimension": {dim}, "capacity": {self.index_capacity}}}
-                """
-            )
-            logging.info(f"Векторный индекс {index_name} успешно создан с размерностью {dim}.")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logging.info("Векторный индекс уже существует.")
-                return
-            logging.error(f"Ошибка при создании векторного индекса: {e}")
-            raise
+        self._create_vector_index("entity_embeddings", "Entity", "embedding", dim)
+        self._create_vector_index("passage_embeddings", "Passage", "embedding", dim)
 
     # ---------- Вспомогательные методы ----------
     def _ensure_schema(self, schema_name: str, schema_type: str = "entity_type") -> None:
@@ -140,25 +129,17 @@ class MemgraphStore:
         rows = list(cursor)
         return rows[0] if rows else None
 
-    def get_passage_text_by_id(self, passage_id: str) -> Optional[str]:
-        query = "MATCH (p:Passage {id: $pid}) RETURN p.text AS text"
-        with self._lock:
-            cursor = self.db.execute_and_fetch(query, {"pid": passage_id})
-        if cursor is None:
-            return None
-        rows = list(cursor)
-        return rows[0]["text"] if rows else None
-
     # ---------- Passage ----------
     def add_passage(self, text: str, passage_id: Optional[str] = None) -> str:
         if passage_id is None:
             passage_id = str(uuid.uuid4())
+        emb = self.embedding_client.embed(text) if self.embedding_client else None
         query = """
         MERGE (p:Passage {id: $id})
-        SET p.text = $text
+        SET p.text = $text, p.embedding = $embedding
         """
         with self._lock:
-            self.db.execute(query, {"id": passage_id, "text": text})
+            self.db.execute(query, {"id": passage_id, "text": text, "embedding": emb})
         return passage_id
 
     # ---------- Entity ----------
@@ -231,7 +212,6 @@ class MemgraphStore:
                 "passage_id": passage_id,
             })
 
-        # Добавляем passage_id в список, если его там ещё нет
         add_passage_query = """
         MATCH (h:Entity {name: $head})-[r:RELATION {type: $relation}]->(t:Entity {name: $tail})
         WHERE NOT $passage_id IN r.based_on
@@ -268,7 +248,7 @@ class MemgraphStore:
             cursor = self.db.execute_and_fetch(query, {"name": start_entity, "limit": breadth})
         return list(cursor) if cursor is not None else []
 
-    # ---------- Поиск и извлечение данных ----------
+    # ---------- Поиск ----------
     def vector_search(self, query_text: str = None, top_k: int = 5, embedding: list = None) -> List[Dict[str, Any]]:
         if embedding is None:
             if not self.embedding_client:
@@ -286,32 +266,42 @@ class MemgraphStore:
             try:
                 cursor = self.db.execute_and_fetch(
                     query,
-                    {
-                        "index_name": "entity_embeddings",
-                        "embedding": embedding,
-                        "top_k": top_k,
-                    },
+                    {"index_name": "entity_embeddings", "embedding": embedding, "top_k": top_k},
                 )
                 return list(cursor) if cursor is not None else []
             except Exception as e:
                 if "Index not found" in str(e) or "does not exist" in str(e):
                     raise RuntimeError(
-                        "Векторный индекс 'entity_embeddings' не найден. "
-                        "Убедитесь, что индекс создан (вызов _init_index)."
+                        "Векторный индекс 'entity_embeddings' не найден."
                     ) from e
                 raise
 
-    def get_passage_for_entity(self, entity_name: str) -> Optional[str]:
+    def vector_search_passages(self, query_text: str = None, top_k: int = 5, embedding: list = None) -> List[Dict[str, Any]]:
+        if embedding is None:
+            if not self.embedding_client:
+                raise ValueError("Не задан embedding_client для векторного поиска")
+            if not query_text:
+                raise ValueError("Нужно указать query_text или embedding")
+            embedding = self.embedding_client.embed(query_text)
+
         query = """
-        MATCH (e:Entity {name: $name})-[:MENTIONED_IN]->(p:Passage)
-        RETURN p.text AS text LIMIT 1
+        CALL vector_search.search($index_name, $top_k, $embedding)
+        YIELD node, distance
+        RETURN node.text AS text, distance AS score
         """
         with self._lock:
-            cursor = self.db.execute_and_fetch(query, {"name": entity_name})
-        if cursor is None:
-            return None
-        rows = list(cursor)
-        return rows[0]["text"] if rows else None
+            try:
+                cursor = self.db.execute_and_fetch(
+                    query,
+                    {"index_name": "passage_embeddings", "embedding": embedding, "top_k": top_k},
+                )
+                return list(cursor) if cursor is not None else []
+            except Exception as e:
+                if "Index not found" in str(e) or "does not exist" in str(e):
+                    raise RuntimeError(
+                        "Векторный индекс 'passage_embeddings' не найден."
+                    ) from e
+                raise
 
     def get_passages_for_entity(self, entity_name: str, limit: int = 3) -> List[str]:
         query = """
@@ -335,15 +325,6 @@ class MemgraphStore:
             cursor = self.db.execute_and_fetch(query, {"name": entity_name})
         return list(cursor) if cursor is not None else []
 
-    def get_all_relations(self) -> List[Dict[str, Any]]:
-        query = """
-        MATCH (h:Entity)-[r:RELATION]->(t:Entity)
-        RETURN DISTINCT h.name AS head, r.type AS relation, t.name AS tail
-        """
-        with self._lock:
-            cursor = self.db.execute_and_fetch(query)
-        return list(cursor) if cursor is not None else []
-
     def get_all_relations_with_passage(self) -> List[Dict[str, Any]]:
         query = """
         MATCH (h:Entity)-[r:RELATION]->(t:Entity)
@@ -353,16 +334,6 @@ class MemgraphStore:
             cursor = self.db.execute_and_fetch(query)
         return list(cursor) if cursor is not None else []
 
-    def get_entity(self, name: str) -> Optional[Dict[str, Any]]:
-        return self._get_existing_entity(name)
-
     def clear(self) -> None:
         with self._lock:
             self.db.execute("MATCH (n) DETACH DELETE n")
-            if self.embedding_client:
-                try:
-                    self.db.execute("DROP VECTOR INDEX entity_embeddings")
-                except Exception as e:
-                    logging.debug(f"Не удалось удалить векторный индекс: {e}")
-                finally:
-                    self._init_index()

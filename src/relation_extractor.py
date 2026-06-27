@@ -22,8 +22,8 @@ class Relation(BaseModel):
 class RelationExtractor(BaseExtractor):
     """Извлекает отношения между сущностями, опираясь на текст и список найденных сущностей."""
 
-    def __init__(self, llm_config: LLMConfig):
-        super().__init__(llm_config)
+    def __init__(self, llm_config: LLMConfig, max_retries: int = 2, retry_delay: float = 1.0):
+        super().__init__(llm_config, max_retries, retry_delay)
         self.prompt_template = """
 Даны сущности: {entities}
 На основе текста найди все отношения между ними. Отношение должно быть кратким глаголом или фразой (например, "рубил", "растопила", "пошёл на").

@@ -3,7 +3,7 @@
 """
 Главный модуль GraphRAG.
 Объединяет извлечение знаний, построение графа, разрешение конфликтов,
-векторный поиск и Graph of Thoughts для ответа на вопросы.
+векторный поиск (сущности + пассажи) и Graph of Thoughts для ответа на вопросы.
 """
 import logging
 import time
@@ -19,11 +19,10 @@ from relation_extractor import RelationExtractor, Relation
 from memgraph_store import MemgraphStore
 from conflict_resolver import ConflictResolver
 from history_manager import HistoryManager
-from utils import safe_parse_json
 
 from got import (
-    GoTController, Prompter, Parser,
-    Generate, Score, Refine, Merge,
+    GoTController, Prompter, Parser, OperationNode, GraphOfOperations,
+    Generate, Score, Select, Refine, Merge,
     Thought, ROLES, get_random_role
 )
 
@@ -73,6 +72,9 @@ class GraphRAGConfig:
     got_score_enabled: bool = True
     got_use_random_roles: bool = True
     got_roles: List[str] = field(default_factory=lambda: [r["name"] for r in ROLES])
+    got_iterations: int = 1
+    got_select_top_k: int = 3
+    got_use_select: bool = True
 
     @classmethod
     def from_yaml(cls, path: str) -> "GraphRAGConfig":
@@ -227,7 +229,6 @@ class GraphRAG:
                         self.store.add_relation(rel.head, rel.relation, rel.tail, passage_id)
                     self.store.commit()
                 except Exception as e:
-                    # Пытаемся откатить, но не падаем, если транзакции уже нет
                     try:
                         self.store.rollback()
                     except Exception:
@@ -253,20 +254,39 @@ class GraphRAG:
         return passage_ids
 
     def _get_context(self, query: str) -> str:
+        """
+        Гибридный семантический контекст:
+          1. Векторный поиск по сущностям → извлечение отношений с текстом пассажа.
+          2. Векторный поиск по пассажам → добавление фрагментов.
+          3. Случайные блуждания при необходимости.
+        """
         query_embedding = self.embedding_client.embed(query)
+
+        # 1. Сущности
         entities = self.store.vector_search(embedding=query_embedding, top_k=self.config.top_k)
-        if not entities:
-            return ""
+
+        # 2. Пассажи
+        passages = self.store.vector_search_passages(embedding=query_embedding, top_k=self.config.top_k)
 
         context_parts = []
+
+        # Отношения для найденных сущностей с фрагментами пассажей
         for entity in entities:
             entity_name = entity.get("name")
             if not entity_name:
                 continue
             relations = self.store.get_relations_with_context(entity_name)
             for rel in relations:
-                context_parts.append(f"{rel['source']} {rel['relation']} {rel['target']}")
+                passage_snippet = rel.get('passage_text', '')[:200]
+                context_parts.append(f"{rel['source']} {rel['relation']} {rel['target']} | фрагмент: {passage_snippet}")
 
+        # Тексты пассажей
+        for passage in passages:
+            text = passage.get("text", "")
+            if text:
+                context_parts.append(f"Пассаж: {text[:500]}")
+
+        # 3. Random walk
         if self.config.random_walk_depth > 0 and self.config.random_walk_breadth > 0:
             for entity in entities:
                 entity_name = entity.get("name")
@@ -283,72 +303,79 @@ class GraphRAG:
                             f"{step.get('head', '')} {step.get('relation', '')} {step.get('tail', '')}"
                         )
 
+        if not context_parts:
+            return "Нет релевантной информации."
+
         context = "\n".join(context_parts)
         if len(context) > self.config.max_context_length:
             context = context[:self.config.max_context_length]
         return context
 
-    def _direct_answer(self, question: str) -> str:
-        context = self._get_context(question)
-        if not context:
-            return "Не найдено информации для ответа на этот вопрос."
-        prompt = f"""
-        Используя следующий контекст из графа знаний, ответь на вопрос.
-        Если в контексте нет информации, скажи об этом честно.
-        Контекст:
-        {context}
-
-        Вопрос: {question}
-        Ответ:
-        """
-        return self.llm_client.chat(prompt)
-
-    def ask(self, question: str, use_got: Optional[bool] = None) -> str:
-        """
-        Задаёт вопрос. Если включён Graph of Thoughts, запускает многошаговые рассуждения.
-        """
-        start_time = time.time()
+    def ask(self, question: str, use_got: bool = None, **kwargs) -> str:
         if use_got is None:
             use_got = self.config.got_enabled
 
-        if not use_got or self.got_controller is None:
-            final_answer = self._direct_answer(question)
-        else:
-            context = self._get_context(question)
-            if not context:
-                final_answer = "Не найдено информации для ответа на этот вопрос."
-            else:
-                operations = []
-                gen_op = Generate(
-                    num_outputs=self.config.got_num_thoughts,
-                    temperature=self.config.got_generation_temperature,
-                    roles=self.config.got_roles,
-                    use_random_roles=self.config.got_use_random_roles,
-                )
-                operations.append(gen_op)
+        context = self._get_context(question)
 
-                if self.config.got_score_enabled:
-                    operations.append(Score())
+        if not use_got:
+            prompt = f"Контекст:\n{context}\n\nВопрос: {question}\nОтвет:"
+            answer = self.llm_client.chat(prompt)
+            self.history.add_entry(question, answer)
+            return answer
 
-                for _ in range(self.config.got_num_refinements):
-                    operations.append(Refine(temperature=self.config.got_refine_temperature))
-                    if self.config.got_score_enabled:
-                        operations.append(Score())
+        # GoT
+        gen_node = OperationNode(
+            Generate(num_outputs=self.config.got_num_thoughts,
+                     temperature=self.config.got_generation_temperature,
+                     roles=self.config.got_roles,
+                     use_random_roles=self.config.got_use_random_roles),
+            dependencies=[],
+            params={'context': context, 'question': question}
+        )
 
-                if self.config.got_merge_enabled and self.config.got_num_thoughts > 1:
-                    operations.append(Merge(temperature=self.config.got_merge_temperature))
+        score_node = OperationNode(
+            Score(),
+            dependencies=[gen_node],
+            params={'question': question}
+        )
+        
+        nodes = [gen_node, score_node]
+        current_dep = score_node
 
-                final_answer = self.got_controller.run_pipeline(
-                    operations,
-                    initial_input=f"Контекст: {context}\nВопрос: {question}",
-                    question=question,
-                    context=context
-                )
+        if self.config.got_use_select:
+            select_node = OperationNode(
+                Select(top_k=self.config.got_select_top_k),
+                dependencies=[current_dep],
+                params={}
+            )
+            nodes.append(select_node)
+            current_dep = select_node
 
-        elapsed = time.time() - start_time
-        self.history.add_entry(question, final_answer)
-        logging.info(f"Ответ на вопрос занял {elapsed:.2f} сек.")
-        return final_answer
+        for _ in range(self.config.got_iterations):
+            refine_node = OperationNode(
+                Refine(temperature=self.config.got_refine_temperature),
+                dependencies=[current_dep],
+                params={'question': question}
+            )
+            nodes.append(refine_node)
+            current_dep = refine_node
+
+        if self.config.got_merge_enabled:
+            merge_node = OperationNode(
+                Merge(temperature=self.config.got_merge_temperature),
+                dependencies=[current_dep],
+                params={'question': question}
+            )
+            nodes.append(merge_node)
+            current_dep = merge_node
+
+        goo = GraphOfOperations(nodes)
+
+        final_thoughts = self.got_controller.run_goo(goo)
+        answer = final_thoughts[-1].content if final_thoughts else "Не удалось сгенерировать ответ."
+
+        self.history.add_entry(question, answer)
+        return answer
 
     def resolve_conflicts(self, dry_run: bool = False) -> Dict[str, Any]:
         return self.conflict_resolver.detect_and_resolve(dry_run=dry_run)

@@ -1,54 +1,52 @@
 # src/got/controller.py
 
 """
-Контроллер выполнения операций над графом мыслей.
+Контроллер выполнения графа операций (Graph of Operations).
 """
 import logging
-from typing import List, Dict, Any, Optional
-from .graph_state import GraphReasoningState
-from .operations import Operation
-from .prompter import Prompter
-from .parser import Parser
+from typing import List
 from .thought import Thought
-
+from .goo import GraphOfOperations
 
 class GoTController:
-    def __init__(self, llm_client, prompter: Prompter = None, parser: Parser = None):
+    def __init__(self, llm_client, prompter=None, parser=None):
         self.llm_client = llm_client
-        self.prompter = prompter or Prompter()
-        self.parser = parser or Parser()
-        self.state = GraphReasoningState()
+        self.prompter = prompter
+        self.parser = parser
 
-    def execute_operation(self, operation: Operation, inputs: List[str] = None, **kwargs) -> List[str]:
-        if inputs is None:
-            current_thoughts = self.state.get_current_thoughts()
-        else:
-            current_thoughts = self.state.get_thoughts(inputs)
+    def run_goo(self, goo: GraphOfOperations) -> List[Thought]:
+        """
+        Выполняет граф операций (GoO) в топологическом порядке.
+        Возвращает список мыслей из последнего узла графа.
+        """
+        visited = set()
+        order = []
 
-        outputs = operation.execute(
-            current_thoughts,
-            self.prompter,
-            self.parser,
-            self.llm_client,
-            **kwargs
-        )
-        for thought in outputs:
-            self.state.add_thought(thought)
-        self.state.set_current([t.id for t in outputs])
-        return [t.id for t in outputs]
+        def dfs(node):
+            if node in visited:
+                return
+            visited.add(node)
+            for dep in node.dependencies:
+                dfs(dep)
+            order.append(node)
 
-    def run_pipeline(self, operations: List[Operation], initial_input: str = None, **kwargs) -> str:
-        if initial_input:
-            init_thought = Thought(content=initial_input)
-            self.state.add_thought(init_thought)
-            self.state.set_current([init_thought.id])
+        for node in goo.nodes:
+            dfs(node)
 
-        for op in operations:
-            logging.info(f"Выполнение операции: {op.__class__.__name__}")
-            output_ids = self.execute_operation(op, **kwargs)
-            logging.info(f"Операция сгенерировала {len(output_ids)} мыслей.")
+        node_outputs = {}
+        for node in order:
+            inputs = []
+            for dep in node.dependencies:
+                inputs.extend(node_outputs.get(dep, []))
+            outputs = node.operation.execute(
+                inputs,
+                self.prompter,
+                self.parser,
+                self.llm_client,
+                **node.params
+            )
+            node_outputs[node] = outputs
 
-        current = self.state.get_current_thoughts()
-        if current:
-            return current[-1].content
-        return ""
+        if goo.nodes:
+            return node_outputs.get(goo.nodes[-1], [])
+        return []

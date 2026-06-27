@@ -23,16 +23,5 @@ class HistoryManager:
             return list(self.history)
         return list(self.history)[-last_n:]
 
-    def get_history_as_text(self, last_n: Optional[int] = None) -> str:
-        entries = self.get_history(last_n)
-        if not entries:
-            return "История диалога пуста."
-        text = "Предыдущие вопросы и ответы:\n"
-        for i, entry in enumerate(entries, 1):
-            q = entry.get("question", "")
-            a = entry.get("answer", "")
-            text += f"{i}. Вопрос: {q}\n   Ответ: {a}\n"
-        return text
-
     def clear(self) -> None:
         self.history.clear()

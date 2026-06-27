@@ -27,6 +27,9 @@ got_num_refinements: 1
 got_merge_enabled: true
 got_score_enabled: true
 got_use_random_roles: true
+got_iterations: 1
+got_select_top_k: 3
+got_use_select: true
 got_roles:
   - "Аналитик"
   - "Критик"

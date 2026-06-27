@@ -7,7 +7,7 @@
 import hashlib
 import sqlite3
 import json
-from typing import Optional, List, Union
+from typing import Optional
 
 
 class EmbeddingClient:
@@ -85,54 +85,3 @@ class EmbeddingClient:
         conn.commit()
         conn.close()
         return emb
-
-    def embed_batch(
-        self,
-        texts: List[str],
-        prompt_name: Optional[str] = None,
-        prompt: Optional[str] = None,
-    ) -> List[list]:
-        """
-        Возвращает список эмбеддингов для нескольких текстов.
-        Использует одно подключение к БД для всех операций кэширования.
-        """
-        results = []
-        to_encode = []
-        to_encode_indices = []
-        conn = sqlite3.connect(self.cache_db)
-
-        try:
-            for idx, text in enumerate(texts):
-                key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
-                cur = conn.execute("SELECT embedding FROM embedding_cache WHERE key=?", (key,))
-                row = cur.fetchone()
-                if row:
-                    results.append((idx, json.loads(row[0])))
-                else:
-                    to_encode.append(text)
-                    to_encode_indices.append(idx)
-
-            if to_encode:
-                encoded = self.model.encode(
-                    to_encode,
-                    prompt_name=prompt_name,
-                    prompt=prompt,
-                    normalize_embeddings=True,
-                    batch_size=self.batch_size,
-                    precision=self.precision,
-                )
-                for i, emb in enumerate(encoded):
-                    emb_list = emb.tolist()
-                    results.append((to_encode_indices[i], emb_list))
-                    text = to_encode[i]
-                    key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
-                    conn.execute(
-                        "INSERT OR REPLACE INTO embedding_cache (key, embedding) VALUES (?, ?)",
-                        (key, json.dumps(emb_list))
-                    )
-                conn.commit()
-        finally:
-            conn.close()
-
-        results.sort(key=lambda x: x[0])
-        return [r[1] for r in results]
