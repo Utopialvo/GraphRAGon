@@ -1,11 +1,12 @@
 # src/history_manager.py
 
 """
-Модуль для хранения истории запросов и ответов в RAM.
+Хранение истории запросов и ответов в оперативной памяти.
+Реализовано на основе deque с ограничением размера.
+Элементы истории — словари с ключами question и answer.
 """
-
 from collections import deque
-from typing import List, Tuple, Optional
+from typing import List, Optional, Dict
 
 
 class HistoryManager:
@@ -14,9 +15,10 @@ class HistoryManager:
         self.history: deque = deque(maxlen=max_size)
 
     def add_entry(self, question: str, answer: str) -> None:
-        self.history.append((question, answer))
+        entry = {"question": question, "answer": answer}
+        self.history.append(entry)
 
-    def get_history(self, last_n: Optional[int] = None) -> List[Tuple[str, str]]:
+    def get_history(self, last_n: Optional[int] = None) -> List[Dict[str, str]]:
         if last_n is None:
             return list(self.history)
         return list(self.history)[-last_n:]
@@ -26,7 +28,9 @@ class HistoryManager:
         if not entries:
             return "История диалога пуста."
         text = "Предыдущие вопросы и ответы:\n"
-        for i, (q, a) in enumerate(entries, 1):
+        for i, entry in enumerate(entries, 1):
+            q = entry.get("question", "")
+            a = entry.get("answer", "")
             text += f"{i}. Вопрос: {q}\n   Ответ: {a}\n"
         return text
 

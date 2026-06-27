@@ -1,16 +1,16 @@
 # src/relation_extractor.py
 
 """
-Модуль извлечения отношений между сущностями с помощью LLM.
-Парсинг JSON вынесен в utils.safe_parse_json.
+Извлечение отношений между сущностями с помощью LLM.
+Также использует базовый класс BaseExtractor.
 """
-
 import json
 import logging
 from typing import List
 from pydantic import BaseModel, ValidationError
 from llm_client import LLMClient, LLMConfig
 from utils import safe_parse_json
+from llm_entity_extract import BaseExtractor
 
 
 class Relation(BaseModel):
@@ -19,18 +19,17 @@ class Relation(BaseModel):
     tail: str
 
 
-class RelationExtractor:
-    """Извлекает отношения между сущностями на основе текста и списка сущностей."""
+class RelationExtractor(BaseExtractor):
+    """Извлекает отношения между сущностями, опираясь на текст и список найденных сущностей."""
 
     def __init__(self, llm_config: LLMConfig):
-        self.client = LLMClient(llm_config)
+        super().__init__(llm_config)
         self.prompt_template = """
-Ты — система извлечения отношений между сущностями.
 Даны сущности: {entities}
 На основе текста найди все отношения между ними. Отношение должно быть кратким глаголом или фразой (например, "рубил", "растопила", "пошёл на").
 Верни ТОЛЬКО JSON-список объектов с полями "head", "relation", "tail", где head и tail — это тексты сущностей.
 Пример: [{{"head": "Иван", "relation": "рубил", "tail": "дрова"}}]
-Если отношений нет, верни пустой список: []
+Если отношений нет, верни [].
 Текст: {text}
 """
         self.fallback_prompt_template = """
@@ -48,21 +47,13 @@ class RelationExtractor:
         entities_str = ", ".join(entity_texts)
 
         prompt = self.prompt_template.format(entities=entities_str, text=text)
-        response = self.client.chat(prompt, response_format={"type": "json_object"})
-        data = safe_parse_json(response)
-
-        if not data or not isinstance(data, list):
-            logging.warning("Не удалось распарсить отношения из основного промпта, пробуем fallback.")
-            fallback_prompt = self.fallback_prompt_template.format(entities=entities_str, text=text)
-            response = self.client.chat(fallback_prompt, response_format={"type": "json_object"})
-            data = safe_parse_json(response)
+        fallback = self.fallback_prompt_template.format(entities=entities_str, text=text)
+        items = self._extract_with_fallback(prompt, fallback)
 
         relations = []
-        if isinstance(data, list):
-            for item in data:
-                try:
-                    rel = Relation(**item)
-                    relations.append(rel)
-                except (TypeError, ValidationError) as e:
-                    logging.warning(f"Пропускаем некорректное отношение: {item}, ошибка: {e}")
+        for item in items:
+            try:
+                relations.append(Relation(**item))
+            except (TypeError, ValidationError) as e:
+                logging.warning(f"Пропускаем некорректное отношение: {item}, ошибка: {e}")
         return relations

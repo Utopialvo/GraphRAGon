@@ -1,11 +1,9 @@
 # src/conflict_resolver.py
 
 """
-Модуль, который разруливает конфликты между отношениями в графе знаний.
-При слиянии (merge) в новое отношение попадают все ID пассажей из обоих исходных отношений.
-Больше не пытаемся удалить уже удалённое — конфликты разрешаются пошагово внутри каждой пары сущностей.
+Разрешение конфликтов между отношениями в графе знаний.
+При слиянии объединяются идентификаторы пассажей.
 """
-
 import logging
 from collections import defaultdict
 from typing import Dict, Any, List, Optional
@@ -84,9 +82,6 @@ class ConflictResolver:
         return None
 
     def detect_and_resolve(self, dry_run: bool = False) -> Dict[str, Any]:
-        """
-        Проходим по всем парам сущностей, для каждой группы отношений вызываем пошаговое разрешение.
-        """
         triples = self.store.get_all_relations_with_passage()
         groups = defaultdict(list)
         for t in triples:
@@ -105,7 +100,6 @@ class ConflictResolver:
                 )
                 rel_list = rel_list[:self.max_relations_per_pair]
 
-            # нормализуем based_on к списку
             normalized = []
             for r in rel_list:
                 based_on = r['based_on'] if isinstance(r['based_on'], list) else [r['based_on']]
@@ -124,16 +118,9 @@ class ConflictResolver:
         }
 
     def _resolve_group(self, head: str, tail: str, relations: List[Dict[str, Any]], dry_run: bool) -> List[Dict[str, Any]]:
-        """
-        Итеративно разрешает конфликты внутри одной пары (head, tail).
-        После каждого применённого действия обновляет локальный список отношений,
-        чтобы не пытаться удалить уже удалённое.
-        """
         resolved = []
-        # рабочая копия списка отношений
         active = [{'relation': r['relation'], 'based_on': list(r['based_on'])} for r in relations]
 
-        # если осталось 0 или 1 отношение, конфликтов быть не может
         while len(active) > 1:
             found_conflict = False
             n = len(active)
@@ -144,7 +131,6 @@ class ConflictResolver:
                     if r1['relation'] == r2['relation']:
                         continue
 
-                    # ищем текст первого пассажа для каждого отношения
                     p1_id = r1['based_on'][0] if r1['based_on'] else None
                     p2_id = r2['based_on'][0] if r2['based_on'] else None
                     passage1 = self.store.get_passage_text_by_id(p1_id) or "неизвестно"
@@ -171,10 +157,8 @@ class ConflictResolver:
                     resolved.append(conflict_entry)
 
                     if not dry_run:
-                        # Применяем изменения к графу и перестраиваем active
                         if resolution.resolution == "keep_first":
                             self.store.delete_relation(head, r2['relation'], tail)
-                            # оставляем только r1, r2 выкидываем
                             active = [r for idx, r in enumerate(active) if idx != j]
                         elif resolution.resolution == "keep_second":
                             self.store.delete_relation(head, r1['relation'], tail)
@@ -187,23 +171,19 @@ class ConflictResolver:
                                 self.store.add_relation(head, merged_rel, tail, bid)
                             for bid in r2['based_on']:
                                 self.store.add_relation(head, merged_rel, tail, bid)
-                            # новое объединённое отношение
                             new_r = {
                                 'relation': merged_rel,
                                 'based_on': r1['based_on'] + r2['based_on']
                             }
-                            # убираем оба старых, добавляем новое
                             active = [r for idx, r in enumerate(active) if idx != i and idx != j]
                             active.append(new_r)
                         else:
                             logging.warning(f"Неизвестное разрешение: {resolution.resolution}")
 
-                    # после любого изменения списка – начинаем цикл while заново
                     found_conflict = True
                     break
                 if found_conflict:
                     break
             if not found_conflict:
-                break   # больше конфликтов нет
-
+                break
         return resolved

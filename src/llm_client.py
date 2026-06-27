@@ -3,8 +3,8 @@
 """
 Клиент для общения с локальной LLM через OpenAI-совместимый API.
 Кэширует ответы в SQLite, умеет чистить старые записи.
+При вызове можно переопределить температуру.
 """
-
 import json
 import hashlib
 import sqlite3
@@ -15,7 +15,9 @@ from openai import OpenAI
 
 
 class LLMConfig:
-    def __init__(self, model_name: str, base_url: str, api_key: str = "dummy", temperature: float = 0.0):
+    """Настройки подключения к LLM."""
+    def __init__(self, model_name: str, base_url: str, api_key: str = "dummy",
+                 temperature: float = 0.0):
         self.model_name = model_name
         self.base_url = base_url
         self.api_key = api_key
@@ -23,6 +25,7 @@ class LLMConfig:
 
 
 class LLMClient:
+    """Отвечает за запросы к языковой модели с повторами и кэшированием."""
     def __init__(self, config: LLMConfig, cache_db: str = "llm_cache.db",
                  max_retries: int = 3, retry_delay: float = 1.0):
         self.config = config
@@ -41,7 +44,7 @@ class LLMClient:
                 timestamp DATETIME
             )
         """)
-        # совместимость со старыми таблицами без timestamp
+        # Убедимся, что колонка timestamp существует
         cursor = conn.execute("PRAGMA table_info(cache)")
         columns = [row[1] for row in cursor.fetchall()]
         if 'timestamp' not in columns:
@@ -50,10 +53,12 @@ class LLMClient:
         conn.commit()
         conn.close()
 
-    def _cache_key(self, prompt: str, model: str) -> str:
-        return hashlib.md5(f"{prompt}_{model}".encode()).hexdigest()
+    def _cache_key(self, prompt: str, model: str, temperature: float) -> str:
+        """Ключ кэша, зависящий от промпта, модели и температуры."""
+        return hashlib.md5(f"{prompt}_{model}_{temperature:.2f}".encode()).hexdigest()
 
     def cleanup_cache(self, max_age_hours: int = 1) -> int:
+        """Удаляет из кэша записи старше указанного количества часов."""
         cutoff = datetime.now() - timedelta(hours=max_age_hours)
         conn = sqlite3.connect(self.cache_db)
         cur = conn.execute("DELETE FROM cache WHERE timestamp < ?", (cutoff,))
@@ -63,8 +68,14 @@ class LLMClient:
         logging.info(f"Очистка кэша: удалено {deleted} записей старше {max_age_hours} ч.")
         return deleted
 
-    def chat(self, prompt: str, response_format: dict = None) -> str:
-        key = self._cache_key(prompt, self.config.model_name)
+    def chat(self, prompt: str, response_format: dict = None, temperature: float = None) -> str:
+        """
+        Отправляет запрос к LLM. При необходимости подставляет температуру из конфига.
+        """
+        if temperature is None:
+            temperature = self.config.temperature
+
+        key = self._cache_key(prompt, self.config.model_name, temperature)
         conn = sqlite3.connect(self.cache_db)
         cur = conn.execute("SELECT response FROM cache WHERE key=?", (key,))
         row = cur.fetchone()
@@ -81,17 +92,16 @@ class LLMClient:
                     response = self.client.chat.completions.create(
                         model=self.config.model_name,
                         messages=messages,
-                        temperature=self.config.temperature,
+                        temperature=temperature,
                         response_format={"type": "json_object"}
                     )
                 else:
                     response = self.client.chat.completions.create(
                         model=self.config.model_name,
                         messages=messages,
-                        temperature=self.config.temperature
+                        temperature=temperature
                     )
                 content = response.choices[0].message.content
-
                 conn = sqlite3.connect(self.cache_db)
                 conn.execute(
                     "INSERT OR REPLACE INTO cache (key, response, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP)",
@@ -100,12 +110,11 @@ class LLMClient:
                 conn.commit()
                 conn.close()
                 return content
-
             except Exception as e:
                 last_exception = e
                 logging.warning(f"Попытка {attempt+1}/{self.max_retries} не удалась: {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay * (2 ** attempt))
                 else:
-                    logging.error(f"Все попытки исчерпаны: {e}")
+                    logging.error(f"Все {self.max_retries} попыток не удались.")
                     raise last_exception

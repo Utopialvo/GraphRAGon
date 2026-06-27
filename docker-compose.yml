@@ -4,6 +4,7 @@ services:
   memgraph:
     image: memgraph/memgraph-mage:latest
     container_name: memgraph-mage
+    mem_limit: 4g
     user: "1000:1000"
     networks:
       - internal-network
@@ -19,6 +20,8 @@ services:
       - "--query-modules-directory=/usr/lib/memgraph/query_modules"
       - "--storage-snapshot-interval-sec=600"
       - "--storage-snapshot-retention-count=2"
+      - "--memory-limit=2048"
+      - "--storage-gc-cycle-sec=30"
 
   memgraph-lab:
     image: memgraph/lab:latest

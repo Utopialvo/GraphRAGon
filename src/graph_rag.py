@@ -1,18 +1,15 @@
 # src/graph_rag.py
 
 """
-Модуль Graph RAG с поддержкой Graph of Thoughts (GoT).
-Улучшен graceful shutdown: поддержка нескольких экземпляров, единая регистрация atexit.
-Добавлена потокобезопасность при параллельном выполнении подвопросов.
+Главный модуль GraphRAG.
+Объединяет извлечение знаний, построение графа, разрешение конфликтов,
+векторный поиск и Graph of Thoughts для ответа на вопросы.
 """
-
 import logging
 import time
 import atexit
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
-
 import yaml
 
 from llm_client import LLMConfig, LLMClient
@@ -24,26 +21,28 @@ from conflict_resolver import ConflictResolver
 from history_manager import HistoryManager
 from utils import safe_parse_json
 
+from got import (
+    GoTController, Prompter, Parser,
+    Generate, Score, Refine, Merge,
+    Thought, ROLES, get_random_role
+)
 
-# ---------- глобальные настройки graceful shutdown ----------
 _instances = []
 
 def _atexit_shutdown():
-    """Вызывается при завершении процесса, создаёт снепшоты для всех активных экземпляров."""
     for instance in _instances:
         if not instance._closed:
             try:
                 instance.store.snapshot()
-                logging.info(f"Graceful shutdown для экземпляра {id(instance)}: снепшот создан.")
+                logging.info(f"Graceful shutdown для экземпляра {id(instance)}: снэпшот создан.")
             except Exception as e:
                 logging.error(f"Ошибка graceful shutdown для экземпляра {id(instance)}: {e}")
-
 atexit.register(_atexit_shutdown)
 
 
 @dataclass
 class GraphRAGConfig:
-    """Конфигурация для GraphRAG."""
+    """Конфигурация GraphRAG."""
     memgraph_host: str = "localhost"
     memgraph_port: int = 7687
     llm_model: str = "/models/Qwen3.5-9B-Q4_0.gguf"
@@ -64,8 +63,16 @@ class GraphRAGConfig:
     embedding_precision: str = "float32"
     random_walk_depth: int = 2
     random_walk_breadth: int = 3
-    got_parallel: bool = True
-    got_max_workers: int = 4
+    got_enabled: bool = True
+    got_num_thoughts: int = 3
+    got_generation_temperature: float = 0.7
+    got_refine_temperature: float = 0.5
+    got_merge_temperature: float = 0.3
+    got_num_refinements: int = 1
+    got_merge_enabled: bool = True
+    got_score_enabled: bool = True
+    got_use_random_roles: bool = True
+    got_roles: List[str] = field(default_factory=lambda: [r["name"] for r in ROLES])
 
     @classmethod
     def from_yaml(cls, path: str) -> "GraphRAGConfig":
@@ -90,6 +97,17 @@ class GraphRAG:
         self._closed = False
         _instances.append(self)
 
+        # Настройка GoT
+        self.got_prompter = Prompter()
+        self.got_parser = Parser()
+        self.got_controller = None
+        if config.got_enabled:
+            self.got_controller = GoTController(
+                self.llm_client,
+                self.got_prompter,
+                self.got_parser
+            )
+
     def _validate_config(self) -> None:
         if self.config.chunk_size <= self.config.overlap:
             raise ValueError("chunk_size должен быть больше overlap")
@@ -102,26 +120,35 @@ class GraphRAG:
             logging.warning(f"Не удалось проверить LLM endpoint: {e}")
 
     def close(self) -> None:
-        """Явное завершение работы: создаёт снепшот и удаляет экземпляр из списка активных."""
-        if not self._closed:
+        if self._closed:
+            return
+        self._closed = True
+        if hasattr(self, 'store'):
             try:
                 self.store.snapshot()
-                logging.info("Снепшот создан при вызове close().")
             except Exception as e:
-                logging.error(f"Ошибка при создании снепшота в close(): {e}")
-            self._closed = True
-            if self in _instances:
-                _instances.remove(self)
+                logging.error(f"Ошибка при создании снэпшота: {e}")
+        if hasattr(self, 'embedding_client'):
+            try:
+                del self.embedding_client
+            except Exception as e:
+                logging.error(f"Ошибка при закрытии embedding_client: {e}")
+        logging.info("GraphRAG закрыт.")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def _init_components(self) -> None:
-        llm_config = LLMConfig(
+        self.llm_config = LLMConfig(
             model_name=self.config.llm_model,
             base_url=self.config.llm_base_url,
             api_key=self.config.llm_api_key,
             temperature=self.config.llm_temperature,
         )
-        # основной LLM-клиент для однопоточных операций
-        self.llm_client = LLMClient(llm_config, cache_db=self.config.cache_db)
+        self.llm_client = LLMClient(self.llm_config, cache_db=self.config.cache_db)
         self.embedding_client = EmbeddingClient(
             model_name=self.config.embedding_model,
             cache_db=self.config.cache_db,
@@ -132,223 +159,216 @@ class GraphRAG:
             host=self.config.memgraph_host,
             port=self.config.memgraph_port,
             embedding_client=self.embedding_client,
-            auto_create_entities=True,
-            update_type_if_unknown=True,
         )
-        self.entity_extractor = LLMEntityExtractor(llm_config)
-        self.relation_extractor = RelationExtractor(llm_config)
+        self.entity_extractor = LLMEntityExtractor(self.llm_config)
+        self.relation_extractor = RelationExtractor(self.llm_config)
         self.conflict_resolver = ConflictResolver(
-            self.store,
-            llm_config,
+            store=self.store,
+            llm_config=self.llm_config,
             max_relations_per_pair=self.config.max_relations_per_pair,
         )
 
     def _cleanup_cache_if_needed(self) -> None:
         if self.config.auto_cleanup_cache:
-            deleted = self.llm_client.cleanup_cache(max_age_hours=self.config.cache_cleanup_hours)
-            logging.info(f"Очистка кэша: удалено {deleted} записей")
+            try:
+                deleted = self.llm_client.cleanup_cache(max_age_hours=self.config.cache_cleanup_hours)
+                logging.info(f"Очистка кэша: удалено {deleted} записей.")
+            except Exception as e:
+                logging.warning(f"Ошибка при очистке кэша: {e}")
 
-    def process_text(self, text: str, chunk_size: Optional[int] = None,
-                     overlap: Optional[int] = None, resolve_conflicts: bool = True) -> List[str]:
+    def _split_text(self, text: str) -> List[str]:
+        chunks = []
+        start = 0
+        text_len = len(text)
+        max_iterations = text_len // max(1, self.config.chunk_size - self.config.overlap) + 2
+        iterations = 0
+        while start < text_len and iterations < max_iterations:
+            iterations += 1
+            end = min(start + self.config.chunk_size, text_len)
+            if end < text_len:
+                last_space = text.rfind(' ', start, end)
+                if last_space > start:
+                    end = last_space
+            chunks.append(text[start:end])
+            start = end - self.config.overlap
+            if start < 0:
+                start = 0
+            if start >= text_len:
+                break
+        return chunks
+
+    def process_text(self, text: str, source: str = "unknown") -> List[str]:
         start_time = time.time()
-        chunk_size = chunk_size or self.config.chunk_size
-        overlap = overlap or self.config.overlap
-
-        logging.info("Начинаем обработку текста...")
-        passage_ids = self.store.add_large_text(text, chunk_size, overlap)
-
+        chunks = self._split_text(text)
+        logging.info(f"Текст разбит на {len(chunks)} чанков.")
+    
+        passage_ids = []
         total_entities = 0
         total_relations = 0
-
-        for pid in passage_ids:
-            chunk = self.store.get_passage_text_by_id(pid)
-            if not chunk:
-                continue
-
-            self.store.begin()
-            try:
+    
+        self.store.enable_batch_cache()
+        try:
+            for idx, chunk in enumerate(chunks):
+                logging.info(f"Обработка чанка {idx+1}/{len(chunks)}...")
+                logging.debug("Извлечение сущностей...")
                 entities = self.entity_extractor.extract(chunk)
+                logging.debug(f"Найдено {len(entities)} сущностей")
+                logging.debug("Извлечение отношений...")
                 relations = self.relation_extractor.extract(chunk, entities)
-
-                for entity in entities:
-                    self.store.add_entity(entity.text, entity.type, pid)
-                for rel in relations:
-                    self.store.add_relation(rel.head, rel.relation, rel.tail, pid)
-
-                self.store.commit()
+                logging.debug(f"Найдено {len(relations)} отношений")
+    
+                passage_id = f"{source}_{idx}"
+                try:
+                    self.store.begin()
+                    self.store.add_passage(chunk, passage_id)
+                    for ent in entities:
+                        self.store.add_entity(ent.text, ent.type, passage_id)
+                    for rel in relations:
+                        self.store.add_relation(rel.head, rel.relation, rel.tail, passage_id)
+                    self.store.commit()
+                except Exception as e:
+                    # Пытаемся откатить, но не падаем, если транзакции уже нет
+                    try:
+                        self.store.rollback()
+                    except Exception:
+                        pass
+                    logging.error(f"Ошибка при сохранении чанка {idx}: {e}")
+                    continue
+    
+                passage_ids.append(passage_id)
                 total_entities += len(entities)
                 total_relations += len(relations)
-                logging.info(f"Чанк {pid}: {len(entities)} сущностей, {len(relations)} отношений")
-            except Exception as e:
-                self.store.rollback()
-                logging.error(f"Ошибка при обработке чанка {pid}: {e}")
-                raise
-
+                del entities, relations
+        finally:
+            self.store.disable_batch_cache()
+    
+        elapsed = time.time() - start_time
         self.metrics["total_entities"] += total_entities
         self.metrics["total_relations"] += total_relations
         self.metrics["total_passages"] += len(passage_ids)
-
-        if resolve_conflicts:
-            logging.info("Разрешение конфликтов...")
-            stats = self.conflict_resolver.detect_and_resolve(dry_run=False)
-            logging.info(f"Конфликтов: {stats['conflicts_detected']}, разрешено: {stats['resolutions_applied']}")
-
-        self.store.snapshot()
-        elapsed = time.time() - start_time
         self.metrics["processing_time"] += elapsed
-        logging.info(f"Обработка текста завершена за {elapsed:.2f} сек.")
+    
+        logging.info(f"Обработка завершена за {elapsed:.2f} сек. "
+                     f"Сущностей: {total_entities}, отношений: {total_relations}.")
         return passage_ids
 
-    def _decompose_question(self, question: str) -> List[str]:
-        prompt = f"""
-Ты — система, помогающая отвечать на сложные вопросы. Разбей следующий вопрос на несколько более простых подвопросов, на которые можно ответить по отдельности, чтобы затем объединить ответы в полный ответ.
-Верни ТОЛЬКО JSON-список строк с подвопросами.
-Пример: ["Кто участвовал в действиях?","Для чего совершались действия?", "Какие действия выполнял субъект А?", "Какие действия выполняла субъект Б?", "В какое время совершались действия субъекта А по отношению к действиям субъекта Б"]
-Вопрос: {question}
-"""
-        response = self.llm_client.chat(prompt, response_format={"type": "json_object"})
-        try:
-            data = safe_parse_json(response)
-            if isinstance(data, list):
-                return [str(q) for q in data]
-            else:
-                logging.warning("Некорректный ответ декомпозиции, возвращаем исходный вопрос")
-                return [question]
-        except Exception as e:
-            logging.error(f"Ошибка декомпозиции: {e}")
-            return [question]
-
-    def _retrieve_context(self, query: str) -> str:
-        hits = self.store.vector_search(query, top_k=self.config.top_k)
-        context_parts = []
-
-        for hit in hits:
-            entity_name = hit['name']
-            passages = self.store.get_passages_for_entity(entity_name, limit=2)
-            context_parts.extend(passages)
-
-            try:
-                related = self.store.get_relations_with_context(entity_name)
-                for rel in related[:self.config.random_walk_breadth]:
-                    if rel['source'] == entity_name:
-                        neighbor = rel['target']
-                    else:
-                        neighbor = rel['source']
-                    neighbor_passages = self.store.get_passages_for_entity(neighbor, limit=1)
-                    context_parts.extend(neighbor_passages)
-            except Exception as e:
-                logging.debug(f"Random walk для {entity_name} не удался: {e}")
-
-        # Убираем дубликаты, сохраняя порядок
-        unique_parts = list(dict.fromkeys(context_parts))
-        return "\n".join(unique_parts)[:self.config.max_context_length]
-
-    def _answer_subquestion(self, sub_q: str, llm_client: Optional[LLMClient] = None) -> str:
-        """Отвечает на один подвопрос. Можно передать отдельный LLMClient для потоков."""
-        context = self._retrieve_context(sub_q)
-        client = llm_client if llm_client is not None else self.llm_client
-        sub_prompt = f"""
-На основе контекста ответь на подвопрос:
-Подвопрос: {sub_q}
-Контекст: {context if context else "Контекст отсутствует."}
-Ответ (кратко):
-"""
-        try:
-            return client.chat(sub_prompt)
-        except Exception as e:
-            logging.error(f"Ошибка при ответе на подвопрос '{sub_q}': {e}")
+    def _get_context(self, query: str) -> str:
+        query_embedding = self.embedding_client.embed(query)
+        entities = self.store.vector_search(embedding=query_embedding, top_k=self.config.top_k)
+        if not entities:
             return ""
 
-    def _aggregate_answers(self, question: str, sub_answers: List[str], history_text: str) -> str:
-        combined = "\n".join([f"- {ans}" for ans in sub_answers if ans])
-        prompt = f"""
-Ты — помощник, отвечающий на вопросы на русском языке на основе предоставленных ответов на подвопросы и истории диалога.
+        context_parts = []
+        for entity in entities:
+            entity_name = entity.get("name")
+            if not entity_name:
+                continue
+            relations = self.store.get_relations_with_context(entity_name)
+            for rel in relations:
+                context_parts.append(f"{rel['source']} {rel['relation']} {rel['target']}")
 
-История диалога:
-{history_text}
-
-Ответы на подвопросы:
-{combined}
-
-Исходный вопрос пользователя: {question}
-
-Сформулируй единый, связный и полный ответ на русском языке, используя информацию из ответов на подвопросы.
-Ответ (кратко и по делу):
-"""
-        try:
-            return self.llm_client.chat(prompt)
-        except Exception as e:
-            logging.error(f"Ошибка агрегации: {e}")
-            return "Извините, не удалось сформулировать ответ."
-
-    def ask(self, question: str, use_got: bool = True) -> str:
-        start_time = time.time()
-        history_text = self.history.get_history_as_text(last_n=self.config.history_max_size)
-
-        if not use_got:
-            context = self._retrieve_context(question)
-            prompt = f"""
-Ты — помощник, отвечающий на вопросы на русском языке на основе предоставленного контекста.
-История диалога:
-{history_text}
-
-Контекст:
-{context if context else "Контекст отсутствует."}
-
-Вопрос: {question}
-Ответ (кратко и по делу):
-"""
-            answer = self.llm_client.chat(prompt)
-        else:
-            sub_questions = self._decompose_question(question)
-            logging.info(f"Декомпозиция: {sub_questions}")
-
-            if self.config.got_parallel and len(sub_questions) > 1:
-                sub_answers = [""] * len(sub_questions)
-                # для каждого потока создаём свой LLMClient, чтобы избежать гонок в HTTP-клиенте
-                llm_config = LLMConfig(
-                    model_name=self.config.llm_model,
-                    base_url=self.config.llm_base_url,
-                    api_key=self.config.llm_api_key,
-                    temperature=self.config.llm_temperature,
+        if self.config.random_walk_depth > 0 and self.config.random_walk_breadth > 0:
+            for entity in entities:
+                entity_name = entity.get("name")
+                if not entity_name:
+                    continue
+                walk = self.store.random_walk(
+                    start_entity=entity_name,
+                    depth=self.config.random_walk_depth,
+                    breadth=self.config.random_walk_breadth,
                 )
-                with ThreadPoolExecutor(max_workers=self.config.got_max_workers) as executor:
-                    future_to_idx = {}
-                    for idx, sub_q in enumerate(sub_questions):
-                        # отдельный клиент на каждый поток
-                        thread_client = LLMClient(llm_config, cache_db=self.config.cache_db)
-                        future = executor.submit(self._answer_subquestion, sub_q, thread_client)
-                        future_to_idx[future] = idx
-                    for future in as_completed(future_to_idx):
-                        idx = future_to_idx[future]
-                        try:
-                            sub_answers[idx] = future.result()
-                        except Exception as e:
-                            logging.error(f"Ошибка при обработке подвопроса {idx}: {e}")
-                            sub_answers[idx] = ""
+                for step in walk:
+                    if isinstance(step, dict):
+                        context_parts.append(
+                            f"{step.get('head', '')} {step.get('relation', '')} {step.get('tail', '')}"
+                        )
+
+        context = "\n".join(context_parts)
+        if len(context) > self.config.max_context_length:
+            context = context[:self.config.max_context_length]
+        return context
+
+    def _direct_answer(self, question: str) -> str:
+        context = self._get_context(question)
+        if not context:
+            return "Не найдено информации для ответа на этот вопрос."
+        prompt = f"""
+        Используя следующий контекст из графа знаний, ответь на вопрос.
+        Если в контексте нет информации, скажи об этом честно.
+        Контекст:
+        {context}
+
+        Вопрос: {question}
+        Ответ:
+        """
+        return self.llm_client.chat(prompt)
+
+    def ask(self, question: str, use_got: Optional[bool] = None) -> str:
+        """
+        Задаёт вопрос. Если включён Graph of Thoughts, запускает многошаговые рассуждения.
+        """
+        start_time = time.time()
+        if use_got is None:
+            use_got = self.config.got_enabled
+
+        if not use_got or self.got_controller is None:
+            final_answer = self._direct_answer(question)
+        else:
+            context = self._get_context(question)
+            if not context:
+                final_answer = "Не найдено информации для ответа на этот вопрос."
             else:
-                sub_answers = [self._answer_subquestion(sub_q) for sub_q in sub_questions]
+                operations = []
+                gen_op = Generate(
+                    num_outputs=self.config.got_num_thoughts,
+                    temperature=self.config.got_generation_temperature,
+                    roles=self.config.got_roles,
+                    use_random_roles=self.config.got_use_random_roles,
+                )
+                operations.append(gen_op)
 
-            answer = self._aggregate_answers(question, sub_answers, history_text)
+                if self.config.got_score_enabled:
+                    operations.append(Score())
 
-        self.history.add_entry(question, answer)
+                for _ in range(self.config.got_num_refinements):
+                    operations.append(Refine(temperature=self.config.got_refine_temperature))
+                    if self.config.got_score_enabled:
+                        operations.append(Score())
+
+                if self.config.got_merge_enabled and self.config.got_num_thoughts > 1:
+                    operations.append(Merge(temperature=self.config.got_merge_temperature))
+
+                final_answer = self.got_controller.run_pipeline(
+                    operations,
+                    initial_input=f"Контекст: {context}\nВопрос: {question}",
+                    question=question,
+                    context=context
+                )
+
         elapsed = time.time() - start_time
+        self.history.add_entry(question, final_answer)
         logging.info(f"Ответ на вопрос занял {elapsed:.2f} сек.")
-        return answer
+        return final_answer
 
-    def get_metrics(self) -> Dict[str, Any]:
-        return self.metrics.copy()
+    def resolve_conflicts(self, dry_run: bool = False) -> Dict[str, Any]:
+        return self.conflict_resolver.detect_and_resolve(dry_run=dry_run)
+
+    def get_history(self, last_n: Optional[int] = None) -> List:
+        return self.history.get_history(last_n)
+
+    def clear_history(self) -> None:
+        self.history.clear()
 
     def clear(self) -> None:
+        """Очищает граф и историю."""
         self.store.clear()
-        self.history.clear()
+        self.clear_history()
         self.metrics = {
             "total_entities": 0,
             "total_relations": 0,
             "total_passages": 0,
             "processing_time": 0.0,
         }
-        logging.info("Граф, история и метрики очищены.")
 
-    def get_history(self) -> List[Dict[str, str]]:
-        return [{"question": q, "answer": a} for q, a in self.history.get_history()]
+    def get_metrics(self) -> Dict[str, Any]:
+        return self.metrics

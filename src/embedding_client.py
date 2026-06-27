@@ -1,10 +1,9 @@
 # src/embedding_client.py
 
 """
-Модуль для вычисления текстовых эмбеддингов с использованием sentence-transformers.
-Улучшено кэширование: одно соединение на батч в embed_batch.
+Клиент для вычисления текстовых эмбеддингов с использованием sentence-transformers.
+Результаты кэшируются в SQLite.
 """
-
 import hashlib
 import sqlite3
 import json
@@ -12,7 +11,7 @@ from typing import Optional, List, Union
 
 
 class EmbeddingClient:
-    """Клиент для генерации эмбеддингов текстов с кэшированием."""
+    """Генерирует векторные представления текстов с локальным кэшированием."""
 
     def __init__(
         self,
@@ -61,9 +60,7 @@ class EmbeddingClient:
         prompt_name: Optional[str] = None,
         prompt: Optional[str] = None,
     ) -> list:
-        """
-        Возвращает нормализованный эмбеддинг для одного текста.
-        """
+        """Возвращает нормализованный эмбеддинг для одного текста."""
         key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
         conn = sqlite3.connect(self.cache_db)
         cur = conn.execute("SELECT embedding FROM embedding_cache WHERE key=?", (key,))
@@ -97,7 +94,7 @@ class EmbeddingClient:
     ) -> List[list]:
         """
         Возвращает список эмбеддингов для нескольких текстов.
-        Оптимизация: одно открытие БД для всех операций кэша.
+        Использует одно подключение к БД для всех операций кэширования.
         """
         results = []
         to_encode = []
@@ -105,7 +102,6 @@ class EmbeddingClient:
         conn = sqlite3.connect(self.cache_db)
 
         try:
-            # Проверяем кэш для каждого текста
             for idx, text in enumerate(texts):
                 key = hashlib.md5(f"{text}_{prompt_name}_{prompt}".encode()).hexdigest()
                 cur = conn.execute("SELECT embedding FROM embedding_cache WHERE key=?", (key,))
@@ -138,6 +134,5 @@ class EmbeddingClient:
         finally:
             conn.close()
 
-        # Сортируем по исходному порядку
         results.sort(key=lambda x: x[0])
         return [r[1] for r in results]

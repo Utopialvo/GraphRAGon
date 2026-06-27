@@ -1,32 +1,33 @@
 # src/utils.py
 
 """
-Утилиты для безопасного разбора JSON из ответов LLM.
-LLM иногда возвращает текст с лишними пояснениями, поэтому приходится выковыривать JSON.
+Безопасный разбор JSON, который возвращает LLM.
+Модель иногда добавляет лишний текст до или после JSON‑структуры.
+Функции здесь стараются вытащить чистый JSON из любого подобного ответа.
 """
-
 import json
 import re
 import logging
-from typing import Optional, List, Any
+from typing import Optional, Any
 
 
 def safe_parse_json(response: str) -> Optional[Any]:
     """
-    Извлекает JSON-объект или массив из строки ответа модели.
-    Поддерживает блоки ```json ... ``` и поиск первой/последней скобки.
-    Возвращает распарсенный объект или None.
+    Извлекает первый JSON-объект или массив из строки.
+    Поддерживает блоки с тройными обратными кавычками ```json ... ```,
+    а также ищет первую открывающую скобку { или [.
+    Если ничего не получается, возвращает None.
     """
     if not response or not response.strip():
         return None
 
-    # Поиск блока ```json ... ```
+    # Попытка найти блок в формате Markdown
     json_pattern = r'```json\s*([\s\S]*?)\s*```'
     match = re.search(json_pattern, response)
     if match:
-        json_str = match.group(1)
+        json_str = match.group(1).strip()
     else:
-        # Ищем первую { или [
+        # Ищем первую фигурную или квадратную скобку
         start = response.find('[')
         if start == -1:
             start = response.find('{')
@@ -35,7 +36,7 @@ def safe_parse_json(response: str) -> Optional[Any]:
             if end == -1:
                 end = response.rfind('}')
             if end != -1 and end > start:
-                json_str = response[start:end+1]
+                json_str = response[start:end + 1]
             else:
                 json_str = response[start:]
         else:
@@ -44,5 +45,5 @@ def safe_parse_json(response: str) -> Optional[Any]:
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
-        logging.debug(f"Не удалось разобрать JSON из строки: {response[:200]}")
+        logging.debug(f"Не удалось разобрать JSON из ответа: {response[:200]}")
         return None
