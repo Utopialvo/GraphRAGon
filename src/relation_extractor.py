@@ -1,59 +1,63 @@
-# src/relation_extractor.py
-
+# GraphRAGon/src/relation_extractor.py
 """
-Извлечение отношений между сущностями с помощью LLM.
-Также использует базовый класс BaseExtractor.
+Извлечение отношений между сущностями с помощью LangChain и структурированного вывода.
 """
-import json
 import logging
 from typing import List
-from pydantic import BaseModel, ValidationError
-from llm_client import LLMClient, LLMConfig
-from utils import safe_parse_json
-from llm_entity_extract import BaseExtractor
-
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 
 class Relation(BaseModel):
-    head: str
-    relation: str
-    tail: str
+    head: str = Field(description="Головная сущность")
+    relation: str = Field(description="Тип отношения (глагол или фраза)")
+    tail: str = Field(description="Хвостовая сущность")
 
+class RelationsList(BaseModel):
+    relations: List[Relation] = Field(default_factory=list)
 
-class RelationExtractor(BaseExtractor):
-    """Извлекает отношения между сущностями, опираясь на текст и список найденных сущностей."""
-
-    def __init__(self, llm_config: LLMConfig, max_retries: int = 2, retry_delay: float = 1.0):
-        super().__init__(llm_config, max_retries, retry_delay)
-        self.prompt_template = """
-Даны сущности: {entities}
-На основе текста найди все отношения между ними. Отношение должно быть кратким глаголом или фразой (например, "рубил", "растопила", "пошёл на").
-Верни ТОЛЬКО JSON-список объектов с полями "head", "relation", "tail", где head и tail — это тексты сущностей.
-Пример: [{{"head": "Иван", "relation": "рубил", "tail": "дрова"}}]
-Если отношений нет, верни [].
-Текст: {text}
-"""
-        self.fallback_prompt_template = """
-Извлеки отношения между сущностями из текста. 
-Сущности: {entities}
-Текст: {text}
-Верни JSON-массив объектов с ключами "head", "relation", "tail". 
-Пример: [{{"head": "Иван", "relation": "рубил", "tail": "дрова"}}]
-Если отношений нет, верни [].
-Ответ (только JSON):
-"""
+class RelationExtractor:
+    def __init__(self, llm: ChatOpenAI, max_retries: int = 2):
+        self.llm = llm
+        self.max_retries = max_retries
+        self.prompt = ChatPromptTemplate.from_messages([
+        ("system", """\
+        <role>Извлечение отношений</role>
+        <task>Найди отношения между перечисленными сущностями, опираясь на текст.  
+        Отношение – краткий глагол или фраза (инфинитив или прошедшее время).  
+        Верни только JSON-список объектов с ключами "head", "relation", "tail".  
+        Если отношений нет – верни пустой список.</task>
+        <example>
+        Сущности: Иван, дрова, сарай, утро, нарубил, печь, Варвара, растопила
+        Текст: "Утром Иван нарубил дрова в сарае. Затем Варвара растопила печь."
+        Ответ:
+        [
+          {{"head": "Иван", "relation": "нарубил", "tail": "дрова"}},
+          {{"head": "Иван", "relation": "находился в", "tail": "сарай"}},
+          {{"head": "Варвара", "relation": "растопила", "tail": "печь"}}
+        ]
+        </example>
+        <example>
+        Сущности: рыба, Иван, речка, ловить
+        Текст: "Иван пошёл на речку и стал ловить рыбу."
+        Ответ:
+        [
+          {{"head": "Иван", "relation": "пошёл на", "tail": "речка"}},
+          {{"head": "Иван", "relation": "ловил", "tail": "рыбу"}}
+        ]
+        </example>"""),
+            ("human", "<entities>{entities}</entities>\n<text>{text}</text>")
+        ])
+        self.chain = self.prompt | self.llm.with_structured_output(RelationsList)
 
     def extract(self, text: str, entities: List) -> List[Relation]:
         entity_texts = [e.text if hasattr(e, 'text') else e.get('text', '') for e in entities]
         entities_str = ", ".join(entity_texts)
-
-        prompt = self.prompt_template.format(entities=entities_str, text=text)
-        fallback = self.fallback_prompt_template.format(entities=entities_str, text=text)
-        items = self._extract_with_fallback(prompt, fallback)
-
-        relations = []
-        for item in items:
+        for attempt in range(self.max_retries + 1):
             try:
-                relations.append(Relation(**item))
-            except (TypeError, ValidationError) as e:
-                logging.warning(f"Пропускаем некорректное отношение: {item}, ошибка: {e}")
-        return relations
+                result = self.chain.invoke({"entities": entities_str, "text": text})
+                return result.relations
+            except Exception as e:
+                logging.warning(f"Попытка {attempt+1}/{self.max_retries+1} не удалась: {e}")
+        logging.error("Не удалось извлечь отношения после всех попыток.")
+        return []

@@ -1,84 +1,86 @@
-# src/conflict_resolver.py
-
+# GraphRAGon/src/conflict_resolver.py
 """
 Разрешение конфликтов между отношениями в графе знаний.
-При слиянии объединяются идентификаторы пассажей.
 """
 import logging
 from collections import defaultdict
 from typing import Dict, Any, List, Optional
 
-from pydantic import BaseModel, ValidationError
-
-from llm_client import LLMClient, LLMConfig
-from memgraph_store import MemgraphStore
-from utils import safe_parse_json
-
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 
 class ConflictResolution(BaseModel):
-    conflict: bool
-    resolution: Optional[str] = None   # keep_first, keep_second, merge
-    new_relation: Optional[str] = None
-    explanation: Optional[str] = None
-
+    conflict: bool = Field(description="Есть ли конфликт")
+    resolution: Optional[str] = Field(default=None, description="keep_first, keep_second или merge")
+    new_relation: Optional[str] = Field(default=None, description="Новое отношение при merge")
+    explanation: Optional[str] = Field(default=None, description="Пояснение")
 
 class ConflictResolver:
     def __init__(
         self,
-        store: MemgraphStore,
-        llm_config: LLMConfig,
+        store,
+        llm: ChatOpenAI,
         max_retries: int = 2,
         max_relations_per_pair: int = 10,
     ):
         self.store = store
-        self.llm_client = LLMClient(llm_config)
+        self.llm = llm
         self.max_retries = max_retries
         self.max_relations_per_pair = max_relations_per_pair
-        self.conflict_prompt = """
-Ты — система разрешения конфликтов в графе знаний.
-Даны две тройки (субъект, отношение, объект), которые относятся к одним и тем же субъекту и объекту.
-Также даны текстовые фрагменты (Passage), на основе которых были извлечены эти отношения.
-Определи, являются ли эти отношения конфликтующими (противоречащими друг другу) или совместимыми.
-Если они конфликтуют, предложи, какое отношение следует оставить (или как их объединить).
-Верни ТОЛЬКО JSON с полями:
-- "conflict": true/false
-- "resolution": "keep_first", "keep_second", "merge" (если conflict == true)
-- "new_relation": (если resolution == "merge") предложение нового отношения (строка)
-- "explanation": краткое пояснение
 
-Тройка 1: {triple1}
-Текст основания 1: {passage1}
-Тройка 2: {triple2}
-Текст основания 2: {passage2}
-Ответ:
-"""
+        self.prompt = ChatPromptTemplate.from_messages([
+        ("system", """\
+        <role>Разрешение конфликтов в графе знаний</role>
+        <task>Даны две тройки (субъект, отношение, объект) для одной и той же пары сущностей,
+        а также текстовые фрагменты, из которых они извлечены.
+        Определи, противоречат ли эти отношения друг другу.
+        Если конфликта нет – укажи "conflict": false.
+        Если конфликт есть – выбери одно из решений:
+        - "keep_first" – оставить первую тройку,
+        - "keep_second" – оставить вторую тройку,
+        - "merge" – объединить в новое отношение (поле "new_relation").
+        Дай краткое пояснение в "explanation".</task>
+        <rules>
+        1. Если оба отношения могут быть истинны одновременно (например, "пошёл" и "ловил") – конфликта нет.
+        2. Если одно исключает другое (противоположные действия, разные локации в одно время) – конфликт есть.
+        3. При объединении выбери наиболее точное обобщение.
+        </rules>
+        <example>
+        Тройка 1: (Иван, нарубил, дрова) | Пассаж 1: "Иван нарубил дрова"
+        Тройка 2: (Иван, сломал, дрова) | Пассаж 2: "Иван сломал дрова"
+        Ответ: {{"conflict": false}}
+        </example>
+        <example>
+        Тройка 1: (Иван, пошёл в лес, утром) | Пассаж 1: "Иван пошёл в лес утром"
+        Тройка 2: (Иван, остался дома, утром) | Пассаж 2: "Иван остался дома утром"
+        Ответ: {{"conflict": true, "resolution": "keep_first", "new_relation": null, "explanation": "Второй пассаж противоречит первому, оставляем первый как более ранний."}}
+        </example>"""),
+            ("human", """\
+        <case>
+        <triple1>{triple1}</triple1>
+        <passage1>{passage1}</passage1>
+        <triple2>{triple2}</triple2>
+        <passage2>{passage2}</passage2>
+        </case>""")
+        ])
+        self.chain = self.prompt | self.llm.with_structured_output(ConflictResolution)
 
     def _get_resolution(self, triple1: str, passage1: str, triple2: str, passage2: str) -> Optional[ConflictResolution]:
-        prompt = self.conflict_prompt.format(
-            triple1=triple1,
-            passage1=passage1,
-            triple2=triple2,
-            passage2=passage2,
-        )
         for attempt in range(self.max_retries):
             try:
-                response = self.llm_client.chat(prompt, response_format={"type": "json_object"})
-                data = safe_parse_json(response)
-                if data is None:
+                result = self.chain.invoke({
+                    "triple1": triple1,
+                    "passage1": passage1,
+                    "triple2": triple2,
+                    "passage2": passage2,
+                })
+                if result.conflict and result.resolution not in ("keep_first", "keep_second", "merge"):
+                    logging.warning(f"Некорректное разрешение: {result.resolution}")
                     continue
-                resolution = ConflictResolution(**data)
-                if resolution.conflict and resolution.resolution not in ("keep_first", "keep_second", "merge"):
-                    logging.warning(f"Некорректное разрешение: {resolution.resolution}, повторная попытка")
-                    continue
-                return resolution
-            except (ValidationError, Exception) as e:
+                return result
+            except Exception as e:
                 logging.warning(f"Попытка {attempt+1}/{self.max_retries} не удалась: {e}")
-                if attempt == self.max_retries - 1:
-                    logging.error(
-                        f"Не удалось получить валидное разрешение после {self.max_retries} попыток. "
-                        f"Ответ: {response[:200] if 'response' in locals() else 'нет ответа'}"
-                    )
-                    return None
         return None
 
     def detect_and_resolve(self, dry_run: bool = False) -> Dict[str, Any]:
@@ -88,25 +90,17 @@ class ConflictResolver:
             groups[(t['head'], t['tail'])].append(t)
 
         all_conflicts = []
-
         for (head, tail), rel_list in groups.items():
             if len(rel_list) < 2:
                 continue
-
             if len(rel_list) > self.max_relations_per_pair:
-                logging.warning(
-                    f"Паре ({head}, {tail}) найдено {len(rel_list)} отношений, "
-                    f"обрабатываем только первые {self.max_relations_per_pair}"
-                )
+                logging.warning(f"Паре ({head}, {tail}) найдено {len(rel_list)} отношений, обрабатываем первые {self.max_relations_per_pair}")
                 rel_list = rel_list[:self.max_relations_per_pair]
 
             normalized = []
             for r in rel_list:
                 based_on = r['based_on'] if isinstance(r['based_on'], list) else [r['based_on']]
-                normalized.append({
-                    'relation': r['relation'],
-                    'based_on': based_on
-                })
+                normalized.append({'relation': r['relation'], 'based_on': based_on})
 
             group_conflicts = self._resolve_group(head, tail, normalized, dry_run)
             all_conflicts.extend(group_conflicts)
@@ -120,8 +114,11 @@ class ConflictResolver:
     def _resolve_group(self, head: str, tail: str, relations: List[Dict[str, Any]], dry_run: bool) -> List[Dict[str, Any]]:
         resolved = []
         active = [{'relation': r['relation'], 'based_on': list(r['based_on'])} for r in relations]
+        max_loop = len(active) * 2  # защита от бесконечного цикла
+        iterations = 0
 
-        while len(active) > 1:
+        while len(active) > 1 and iterations < max_loop:
+            iterations += 1
             found_conflict = False
             n = len(active)
             for i in range(n):
@@ -186,4 +183,6 @@ class ConflictResolver:
                     break
             if not found_conflict:
                 break
+        if iterations >= max_loop:
+            logging.warning(f"Достигнут лимит итераций при разрешении конфликтов для пары ({head}, {tail})")
         return resolved

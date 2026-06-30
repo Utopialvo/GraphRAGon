@@ -1,4 +1,4 @@
-# src/history_manager.py
+# GraphRAGon/src/history_manager.py
 
 """
 Хранение истории запросов и ответов в оперативной памяти.

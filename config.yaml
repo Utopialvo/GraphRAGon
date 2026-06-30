@@ -1,3 +1,5 @@
+# GraphRAGon/config.yaml
+
 memgraph_host: "memgraph-mage"
 memgraph_port: 7687
 llm_model: "/models/Qwen3.5-9B-Q4_0.gguf"
@@ -10,7 +12,7 @@ chunk_size: 1000
 overlap: 200
 history_max_size: 10
 top_k: 5
-max_context_length: 3000
+max_context_length: 30000
 auto_cleanup_cache: true
 cache_cleanup_hours: 1
 max_relations_per_pair: 10
@@ -23,7 +25,6 @@ got_num_thoughts: 3
 got_generation_temperature: 0.7
 got_refine_temperature: 0.5
 got_merge_temperature: 0.3
-got_num_refinements: 1
 got_merge_enabled: true
 got_score_enabled: true
 got_use_random_roles: true
